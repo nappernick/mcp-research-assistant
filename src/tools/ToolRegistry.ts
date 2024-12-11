@@ -1,5 +1,6 @@
 // src/tools/ToolRegistry.ts
 // @ts-ignore
+
 import type { ToolFunction } from 'mcp-wrapper';
 
 export class ToolRegistry {

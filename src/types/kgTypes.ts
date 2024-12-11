@@ -1,27 +1,25 @@
 // mcp-research-assistant/src/types/kgTypes.ts
 
 export interface Entity {
+  id: string;
   name: string;
+  description?: string;
   type: string;
-  id?: string;
-  observations?: string[];
-  metadata?: Record<string, unknown>;
-  createdAt?: string;
-  updatedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+  url?: string;
+  content?: string; // Ensure this is present
+  [key: string]: any;
 }
 
 export interface Relation {
-  source: string;
-  target: string;
-  relation: string;
-  id?: string;
-  from?: string;  // Entity ID
-  to?: string;    // Entity ID
-  type?: string;
-  label?: string;
-  metadata?: Record<string, unknown>;
-  createdAt?: string;
-  updatedAt?: string;
+  id: string;
+  sourceId: string;
+  targetId: string;
+  type: string;
+  createdAt: string;
+  updatedAt: string;
+  [key: string]: any;
 }
 
 export interface KnowledgeGraph {

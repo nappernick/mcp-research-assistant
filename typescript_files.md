@@ -353,7 +353,8 @@ import { loadConfig } from './config';
 import { ExaClient } from './exaClient';
 import { KnowledgeGraphManager } from './knowledgeGraphManager';
 import { LLMClient } from './llmclient';
-import MCPServerWrapper from 'mcp-wrapper/src/mcp/MCPServer';
+// @ts-ignore
+import { MCPServerWrapper, OpenAIProvider } from 'mcp-wrapper';
 
 // @ts-ignore
 const config = loadConfig(logger);
@@ -376,6 +377,10 @@ export async function initializeAsync() {
     // Load config
     console.log('2. Loading config...');
     // console.log('3. Config loaded:', config);
+
+  // Initialize LLMClient
+  const openAIProvider = new OpenAIProvider(process.env.OPENAI_API_KEY as string); // Replace with your key
+  _llmClient = new LLMClient(openAIProvider);
 
     // Initialize ExaClient
     console.log('4. Initializing ExaClient...');
@@ -441,16 +446,18 @@ export { logger, config };
 ## ./src/exaClient.ts
 
 ```typescript
-import axios, { AxiosInstance } from 'axios';
-import { SearchError } from './types/errors';
-import Logger from './logger';
+// src/exaClient.ts
 
-type LoggerResearchAssistant = typeof Logger
+import Exa from 'exa-js';
+import Logger, { ILogger } from './logger';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface ExaSearchOptions {
   numResults?: number;
-  type?: 'neural' | 'keyword';
+  type?: 'neural' | 'keyword' | 'auto';
   useAutoprompt?: boolean;
+  text?: boolean;
+  highlights?: boolean;
 }
 
 export interface ExaSearchResult {
@@ -458,6 +465,7 @@ export interface ExaSearchResult {
   url?: string;
   title?: string;
   score?: number;
+  highlights?: string[];
 }
 
 export interface ExaSearchResponse {
@@ -465,134 +473,190 @@ export interface ExaSearchResponse {
 }
 
 export class ExaClient {
-  private client: AxiosInstance;
-  private logger: LoggerResearchAssistant;
+  private exa: Exa;
+  private logger: ILogger;
 
-  constructor(apiKey: string, logger: LoggerResearchAssistant) {
-    if (!apiKey) {
-      throw new Error('EXA_API_KEY is required');
-    }
+  constructor(apiKey: string, logger: ILogger) {
+    this.exa = new Exa(apiKey);
     this.logger = logger;
-    this.client = axios.create({
-      baseURL: 'https://api.exa.ai',
-      headers: {
-        'x-api-key': apiKey,
-        'Content-Type': 'application/json'
-      }
-    });
   }
 
-  
+  /**
+   * Performs a search using ExaClient.
+   * @param query The search query.
+   * @param options Optional search parameters.
+   * @returns An array of search results.
+   */
+  async search(query: string, options: ExaSearchOptions = {}): Promise<ExaSearchResult[]> {
+    const { numResults = 10, type = 'auto', useAutoprompt = true } = options;
 
-  async searchAndContents(query: string, options: ExaSearchOptions = {}): Promise<ExaSearchResponse> {
-    const { numResults = 10, type = 'neural', useAutoprompt = true } = options;
-    this.logger.debug('Sending search request to Exa API', { query, numResults, type, useAutoprompt });
+    this.logger.info('Performing search with ExaClient', { query, numResults, type, useAutoprompt });
 
     try {
-      const response = await this.client.post('/search', {
-        query,
+      const searchResponse = await this.exa.searchAndContents(query, {
         numResults,
         type,
-        useAutoprompt
+        useAutoprompt,
+        text: true,
+        highlights: true,
       });
 
-      this.logger.debug('Received response from Exa API', { data: response.data });
-      return response.data;
-    } catch (error) {
-      this.logger.error('Exa API request failed', { error });
-      throw new SearchError('Exa API request failed', { cause: error });
+      const results = searchResponse.results;
+
+      if (!results || results.length === 0) {
+        this.logger.warn('No search results found', { query });
+        return [];
+      }
+
+      const formattedResults = results.map(result => ({
+        ...result,
+        title: result.title ?? 'No Title',
+        id: uuidv4(), // Assign a unique ID to each result if needed
+      }));
+
+      this.logger.debug('Search results received', { results: formattedResults });
+      return formattedResults;
+    } catch (error: any) {
+      this.logger.error('Error performing search', {
+        message: error.message,
+        responseData: error.response?.data,
+      });
+      throw new Error(`Search failed: ${error.message}`);
     }
   }
-} 
+}
+
 ```
 
 
 ## ./src/handlers/searchAndStore.ts
 
 ```typescript
-// mcp-research-assistant/src/handlers/searchAndStore.ts
+// src/handlers/searchAndStore.ts
 
-import { LLMClient } from '../llmclient';
-import { ExaClient } from '../exaClient';
+import { ExaClient, ExaSearchResult } from '../exaClient';
 import { KnowledgeGraphManager } from '../knowledgeGraphManager';
-import Logger from '../logger';
+import { LLMClient } from '../llmclient';
+import { ILogger } from '../logger';
+import { Entity, Relation } from '../types/kgTypes';
 
-type LoggerResearchAssistant = typeof Logger
-
+/**
+ * Handles the 'search_and_store' tool functionality.
+ * @param args The arguments containing the search query and number of results.
+ * @param context The context containing necessary clients and logger.
+ * @returns A message indicating the result of the operation.
+ */
 export async function handleSearchAndStore(
   args: { query: string; numResults?: number },
-  services: {
+  context: {
     exaClient: ExaClient;
     kgManager: KnowledgeGraphManager;
     llmClient: LLMClient;
-    logger: LoggerResearchAssistant;
+    logger: ILogger;
   }
-) {
-  const { query, numResults = 10 } = args;
-  const { exaClient, kgManager, llmClient, logger } = services;
-  logger.debug(`Inside handleSearchAndStore: ${JSON.stringify(exaClient)} kgManager: ${JSON.stringify(kgManager)} llmclient: ${JSON.stringify(llmClient)}`)
+): Promise<any> {
+  const { query, numResults = 5 } = args;
+  const { exaClient, kgManager, llmClient, logger } = context;
 
-  logger.info(`Inside handleSearchAndStore - Starting search and store operation quer: ${JSON.stringify(query)} and num results: ${ numResults }`);
+  logger.info('Executing search_and_store tool', { query, numResults });
 
   if (!query || !query.trim()) {
-    logger.error('Inside handleSearchAndStore -Query parameter is required');
-    throw new Error('Inside handleSearchAndStore -Query parameter is required');
+    logger.error('Query parameter is required');
+    throw new Error('Query parameter is required');
   }
 
   // Perform search using ExaClient
-  let searchResults;
+  let searchResults: ExaSearchResult[];
   try {
-    searchResults = await exaClient.searchAndContents(query, { numResults });
-    logger.info(`Inside handleSearchAndStore - Search results received: ${{ resultCount: searchResults.results.length }}`);
-  } catch (error) {
-    logger.error('Error performing search', { error });
-    throw new Error('Failed to perform search');
+    searchResults = await exaClient.search(query, {
+      numResults,
+      type: 'auto',
+      useAutoprompt: true,
+      text: true,
+    });
+    logger.info('Search results received', { resultCount: searchResults.length });
+  } catch (error: any) {
+    logger.error('Error performing search', { error: error.message });
+    throw new Error(`Failed to perform search: ${error.message}`);
   }
 
-  // Extract texts from search results
-  const texts = searchResults.results.map(result => result.text).filter(text => text);
-
-  logger.debug(`Inside handleSearchAndStore - Extracted texts from search results" ${ texts.length }`);
-
-  if (texts.length === 0) {
-    logger.warn('No content found to process');
-    return { message: 'No content found to process' };
+  if (searchResults.length === 0) {
+    logger.warn('No search results found', { query });
+    return { message: 'No search results found' };
   }
 
-  // Combine texts for processing
-  const combinedText = texts.join('\n\n');
+  // Process results to extract entities and store them
+  const entities: Partial<Entity>[] = searchResults.map((result) => ({
+    name: result.title || 'No Title',
+    type: 'WebPage',
+    url: result.url || '',
+    content: result.text || '',
+    description: result.highlights?.join(' ') || '',
+  }));
 
-  // Extract entities and relations
-  let entitiesAndRelations;
+  // Add entities to the Knowledge Graph
+  let addedEntities: Entity[];
+  try {
+    addedEntities = await kgManager.addEntities(entities);
+    logger.info('Entities added to Knowledge Graph', { count: addedEntities.length });
+  } catch (error: any) {
+    logger.error('Error adding entities to Knowledge Graph', { error: error.message });
+    throw new Error(`Failed to add entities to Knowledge Graph: ${error.message}`);
+  }
+
+  // Combine content from added entities for extraction
+  const combinedText = addedEntities.map((e) => e.content || '').join('\n\n');
+  logger.debug('Combined text for extraction', { combinedTextLength: combinedText.length });
+
+  if (!combinedText.trim()) {
+    logger.warn('Combined text is empty, skipping extraction.');
+    return { message: 'No content available for entity and relation extraction.' };
+  }
+
+  // Extract entities and relations from the combined content
+  let entitiesAndRelations: { entities: Entity[]; relations: Relation[] };
   try {
     entitiesAndRelations = await llmClient.extractEntitiesAndRelations(combinedText);
     logger.info('Extracted entities and relations', {
       entityCount: entitiesAndRelations.entities.length,
       relationCount: entitiesAndRelations.relations.length,
     });
-  } catch (error) {
-    logger.error('Error extracting entities and relations', { error });
-    throw new Error('Failed to extract entities and relations');
+  } catch (error: any) {
+    logger.error('Error extracting entities and relations', { error: error.message });
+    throw new Error(`Failed to extract entities and relations: ${error.message}`);
   }
 
-  // Store entities and relations in the knowledge graph
+  if (entitiesAndRelations.entities.length === 0 && entitiesAndRelations.relations.length === 0) {
+    logger.warn('No new entities or relations extracted from the combined text.');
+    return { message: 'No new entities or relations extracted.' };
+  }
+
+  // Store extracted entities and relations
+  let addedEntitiesRelations: Entity[] = [];
+  let addedRelations: Relation[] = [];
   try {
-    const addedEntities = await kgManager.addEntities(entitiesAndRelations.entities);
-    const addedRelations = await kgManager.addRelations(entitiesAndRelations.relations);
-    logger.info('Stored entities and relations in knowledge graph', {
-      addedEntityCount: addedEntities.length,
-      addedRelationCount: addedRelations.length,
-    });
+    if (entitiesAndRelations.entities.length > 0) {
+      addedEntitiesRelations = await kgManager.addEntities(entitiesAndRelations.entities);
+      logger.info('Stored additional entities in Knowledge Graph', {
+        addedEntityCount: addedEntitiesRelations.length,
+      });
+    }
 
-    return {
-      message: `Added ${addedEntities.length} entities and ${addedRelations.length} relations to the knowledge graph.`,
-    };
-  } catch (error) {
-    logger.error('Error storing entities and relations in knowledge graph', { error });
-    throw new Error('Failed to store entities and relations');
+    if (entitiesAndRelations.relations.length > 0) {
+      addedRelations = await kgManager.addRelations(entitiesAndRelations.relations);
+      logger.info('Stored relations in Knowledge Graph', {
+        addedRelationCount: addedRelations.length,
+      });
+    }
+  } catch (error: any) {
+    logger.error('Error storing entities and relations in Knowledge Graph', { error: error.message });
+    throw new Error(`Failed to store entities and relations: ${error.message}`);
   }
-}
 
+  return {
+    message: `Added ${addedEntitiesRelations.length} entities and ${addedRelations.length} relations to the knowledge graph.`,
+  };
+}
 ```
 
 
@@ -629,106 +693,308 @@ export type { ServerOptions } from './types/serverTypes'
 ## ./src/knowledgeGraphManager.ts
 
 ```typescript
-// knowledgeGraphManager.ts
+// src/knowledgeGraphManager.ts
 
 import { promises as fs } from 'fs';
 import path from 'path';
 import loggerInstance, { ILogger } from './loggerInstance';
+import neo4j, { Driver, Session } from 'neo4j-driver';
+import { v4 as uuidv4 } from 'uuid';
+import { Entity, Relation } from './types/kgTypes'
 
-export interface Entity {
-  id: string;
-  name: string;
-  type: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface Relation {
-  id: string;
-  sourceId: string;
-  targetId: string;
-  type: string;
-  createdAt: string;
-  updatedAt: string;
-}
-
-export interface KnowledgeGraph {
-  entities: Entity[];
-  relations: Relation[];
-  version: string;
-  lastUpdated: string;
-}
-
+/**
+ * Manages the Knowledge Graph by interfacing with a Neo4j database.
+ */
 export class KnowledgeGraphManager {
-  private dataFilePath: string;
-  private graph: KnowledgeGraph;
+  private driver: Driver;
   private logger: ILogger;
 
-  constructor(dataDir: string, logger: ILogger) {
-    this.dataFilePath = path.resolve(dataDir, 'knowledgeGraph.json');
-    this.graph = { entities: [], relations: [], version: '1.0', lastUpdated: '' };
-    this.logger = logger;
-    this.logger.info(`KnowledgeGraphManager initialized with data file path: ${this.dataFilePath}`);
+  /**
+   * Initializes the KnowledgeGraphManager with Neo4j connection parameters.
+   * Ensure that the following environment variables are set:
+   * - NEO4J_URI
+   * - NEO4J_USER
+   * - NEO4J_PASSWORD
+   */
+  constructor() {
+    const neo4jUri = process.env.NEO4J_URI || 'bolt://localhost:7687';
+    const neo4jUser = process.env.NEO4J_USER || 'neo4j';
+    const neo4jPassword = process.env.NEO4J_PASSWORD || 'boopboop';
+
+    this.driver = neo4j.driver(neo4jUri, neo4j.auth.basic(neo4jUser, neo4jPassword));
+    this.logger = loggerInstance;
+
+    this.logger.info(`KnowledgeGraphManager initialized with Neo4j URI: ${neo4jUri}`);
   }
 
+  /**
+   * Initializes the knowledge graph by setting up necessary constraints in Neo4j.
+   * This ensures data integrity by preventing duplicate entries.
+   */
   async initialize(): Promise<void> {
-    this.logger.info('Initializing KnowledgeGraphManager');
-    await this.loadGraph();
-  }
-
-  async addEntities(newEntities: Partial<Entity>[]): Promise<Entity[]> {
-    const timestamp = new Date().toISOString();
-    const entities: Entity[] = newEntities.map((entity) => ({
-      id: generateId(),
-      name: entity.name || '',
-      type: entity.type || '',
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    }));
-
-    this.graph.entities.push(...entities);
-    await this.saveGraph();
-    this.logger.info('Added entities to knowledge graph', { entityCount: entities.length });
-    return entities;
-  }
-
-  async addRelations(newRelations: Partial<Relation>[]): Promise<Relation[]> {
-    const timestamp = new Date().toISOString();
-    const relations: Relation[] = newRelations.map((relation) => ({
-      id: generateId(),
-      sourceId: relation.sourceId || '',
-      targetId: relation.targetId || '',
-      type: relation.type || '',
-      createdAt: timestamp,
-      updatedAt: timestamp,
-    }));
-
-    this.graph.relations.push(...relations);
-    await this.saveGraph();
-    this.logger.info('Added relations to knowledge graph', { relationCount: relations.length });
-    return relations;
-  }
-
-  private async loadGraph() {
+    this.logger.info('Initializing KnowledgeGraphManager with Neo4j constraints');
+    const session = this.driver.session();
     try {
-      const data = await fs.readFile(this.dataFilePath, 'utf-8');
-      this.graph = JSON.parse(data);
-      this.logger.info('Knowledge graph loaded successfully');
-    } catch (error) {
-      this.logger.warn('Knowledge graph file not found, initializing with empty graph.');
-      this.graph = { entities: [], relations: [], version: '1.0', lastUpdated: '' };
+      // Create unique constraints to prevent duplicate entities based on name and type
+      await session.run(`
+        CREATE CONSTRAINT IF NOT EXISTS ON (e:Entity)
+        ASSERT (e.name, e.type) IS UNIQUE
+      `);
+
+      // Create unique constraints for relations based on sourceId, targetId, and type
+      await session.run(`
+        CREATE CONSTRAINT IF NOT EXISTS ON ()-[r:RELATION]-()
+        ASSERT (r.sourceId, r.targetId, r.type) IS UNIQUE
+      `);
+
+      this.logger.info('Neo4j constraints ensured');
+    } catch (error: any) {
+      this.logger.error('Error initializing Neo4j constraints', { error: error.message });
+      throw new Error(`Failed to initialize Neo4j constraints: ${error.message}`);
+    } finally {
+      await session.close();
     }
   }
 
-  private async saveGraph() {
-    this.graph.lastUpdated = new Date().toISOString();
-    await fs.writeFile(this.dataFilePath, JSON.stringify(this.graph, null, 2), 'utf-8');
-    this.logger.info('Knowledge graph saved to disk.');
-  }
-}
+  /**
+   * Adds new entities to the knowledge graph in Neo4j.
+   * @param newEntities An array of partial entities to add.
+   * @returns An array of entities that were successfully added.
+   */
+  async addEntities(newEntities: Partial<Entity>[]): Promise<Entity[]> {
+    if (!newEntities || newEntities.length === 0) {
+      this.logger.warn('No entities provided to add');
+      return [];
+    }
 
-function generateId(): string {
-  return Math.random().toString(36).substring(2, 10);
+    const timestamp = new Date().toISOString();
+    const entities: Entity[] = newEntities.map((entity) => ({
+      id: uuidv4(),
+      name: entity.name?.trim() || 'Unnamed Entity',
+      type: entity.type || 'Unknown',
+      description: entity.description?.trim(),
+      url: entity.url?.trim(),
+      content: entity.content?.trim(),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      ...entity, // Include any additional properties
+    }));
+
+    const session = this.driver.session();
+    const addedEntities: Entity[] = [];
+
+    try {
+      const tx = session.beginTransaction();
+
+      for (const entity of entities) {
+        try {
+          const result = await tx.run(
+            `
+            MERGE (e:Entity {name: $name, type: $type})
+            ON CREATE SET 
+              e.id = $id,
+              e.description = $description,
+              e.url = $url,
+              e.content = $content,
+              e.createdAt = $createdAt,
+              e.updatedAt = $updatedAt,
+              e += $additionalProps
+            ON MATCH SET
+              e.updatedAt = $updatedAt
+            RETURN e
+            `,
+            {
+              name: entity.name,
+              type: entity.type,
+              id: entity.id,
+              description: entity.description,
+              url: entity.url,
+              content: entity.content,
+              createdAt: entity.createdAt,
+              updatedAt: entity.updatedAt,
+              additionalProps: entity, // Spread any additional properties
+            }
+          );
+
+          const singleRecord = result.records[0];
+          const node = singleRecord.get('e');
+
+          const addedEntity: Entity = {
+            id: node.properties.id,
+            name: node.properties.name,
+            type: node.properties.type,
+            description: node.properties.description,
+            url: node.properties.url,
+            content: node.properties.content,
+            createdAt: node.properties.createdAt,
+            updatedAt: node.properties.updatedAt,
+            ...node.properties, // Include any additional properties
+          };
+
+          addedEntities.push(addedEntity);
+        } catch (entityError: any) {
+          if (entityError.code === 'Neo.ClientError.Schema.ConstraintValidationFailed') {
+            this.logger.warn('Duplicate entity detected, skipping addition', { entity: entity.name, type: entity.type });
+          } else {
+            this.logger.error('Error adding entity to Neo4j', { entity: entity.name, error: entityError.message });
+            throw entityError;
+          }
+        }
+      }
+
+      await tx.commit();
+      this.logger.info('Entities added to knowledge graph', { count: addedEntities.length });
+    } catch (error: any) {
+      this.logger.error('Error adding entities to knowledge graph', { error: error.message });
+      throw new Error(`Failed to add entities to knowledge graph: ${error.message}`);
+    } finally {
+      await session.close();
+    }
+
+    return addedEntities;
+  }
+
+  /**
+   * Adds new relations to the knowledge graph in Neo4j.
+   * @param newRelations An array of partial relations to add.
+   * @returns An array of relations that were successfully added.
+   */
+  async addRelations(newRelations: Partial<Relation>[]): Promise<Relation[]> {
+    if (!newRelations || newRelations.length === 0) {
+      this.logger.warn('No relations provided to add');
+      return [];
+    }
+
+    const timestamp = new Date().toISOString();
+    const relations: Relation[] = newRelations.map((relation) => ({
+      id: uuidv4(),
+      sourceId: relation.sourceId || '',
+      targetId: relation.targetId || '',
+      type: relation.type || 'Unknown',
+      createdAt: timestamp,
+      updatedAt: timestamp,
+      ...relation, // Include any additional properties
+    }));
+
+    const session = this.driver.session();
+    const addedRelations: Relation[] = [];
+
+    try {
+      const tx = session.beginTransaction();
+
+      for (const relation of relations) {
+        if (!relation.sourceId || !relation.targetId) {
+          this.logger.warn('Relation missing sourceId or targetId, skipping', { relation });
+          continue;
+        }
+
+        try {
+          const result = await tx.run(
+            `
+            MATCH (source:Entity {id: $sourceId})
+            MATCH (target:Entity {id: $targetId})
+            MERGE (source)-[r:RELATION {type: $type}]->(target)
+            ON CREATE SET 
+              r.id = $id,
+              r.createdAt = $createdAt,
+              r.updatedAt = $updatedAt,
+              r += $additionalProps
+            ON MATCH SET
+              r.updatedAt = $updatedAt
+            RETURN r
+            `,
+            {
+              sourceId: relation.sourceId,
+              targetId: relation.targetId,
+              type: relation.type,
+              id: relation.id,
+              createdAt: relation.createdAt,
+              updatedAt: relation.updatedAt,
+              additionalProps: relation, // Spread any additional properties
+            }
+          );
+
+          if (result.records.length === 0) {
+            this.logger.warn('No relation was created or matched', { relation });
+            continue;
+          }
+
+          const singleRecord = result.records[0];
+          const rel = singleRecord.get('r');
+
+          const addedRelation: Relation = {
+            id: rel.properties.id,
+            sourceId: relation.sourceId,
+            targetId: relation.targetId,
+            type: rel.properties.type,
+            createdAt: rel.properties.createdAt,
+            updatedAt: rel.properties.updatedAt,
+            ...rel.properties, // Include any additional properties
+          };
+
+          addedRelations.push(addedRelation);
+        } catch (relationError: any) {
+          if (relationError.code === 'Neo.ClientError.Schema.ConstraintValidationFailed') {
+            this.logger.warn('Duplicate relation detected, skipping addition', {
+              sourceId: relation.sourceId,
+              targetId: relation.targetId,
+              type: relation.type,
+            });
+          } else {
+            this.logger.error('Error adding relation to Neo4j', {
+              relation: `${relation.sourceId} -> ${relation.targetId}`,
+              error: relationError.message,
+            });
+            throw relationError;
+          }
+        }
+      }
+
+      await tx.commit();
+      this.logger.info('Relations added to knowledge graph', { count: addedRelations.length });
+    } catch (error: any) {
+      this.logger.error('Error adding relations to knowledge graph', { error: error.message });
+      throw new Error(`Failed to add relations to knowledge graph: ${error.message}`);
+    } finally {
+      await session.close();
+    }
+
+    return addedRelations;
+  }
+
+
+
+  async getEntityIdByName(name: string): Promise<string | null> {
+    const session = this.driver.session();
+    try {
+      const result = await session.run(
+        `
+        MATCH (e:Entity {name: $name})
+        RETURN e.id AS id
+        `,
+        { name }
+      );
+  
+      if (result.records.length > 0) {
+        return result.records[0].get('id');
+      }
+  
+      return null;
+    } catch (error: any) {
+      this.logger.error('Error retrieving entity ID by name', { name, error: error.message });
+      throw new Error(`Failed to retrieve entity ID for ${name}`);
+    } finally {
+      await session.close();
+    }
+  }
+
+  /**
+   * Closes the Neo4j driver connection gracefully.
+   */
+  async close(): Promise<void> {
+    await this.driver.close();
+    this.logger.info('Neo4j driver connection closed.');
+  }
 }
 ```
 
@@ -736,161 +1002,335 @@ function generateId(): string {
 ## ./src/llmclient.ts
 
 ```typescript
-// mcp-research-assistant/src/llmclient.ts
+// src/llmclient.ts
 
+  // @ts-ignore
+import * as amqp from 'amqplib';
+import { v4 as uuidv4 } from 'uuid';
+import * as JSON5 from 'json5';
 import logger from './loggerInstance';
+import Ajv, { JSONSchemaType } from 'ajv';
+import llmResponseSchema from './types/lmmResponseSchema.json';
 import {
   ModelProvider,
   ModelMessage,
   ModelProviderOptions,
   ToolFunction,
   ToolResult,
-} from 'mcp-wrapper/src/providers/ModelProvider';
-import {MCPClientWrapper} from 'mcp-wrapper';
+  // @ts-ignore
+} from 'mcp-wrapper';
+import { Entity, Relation } from './types/kgTypes';
 
 export class LLMClient implements ModelProvider {
-  private mcpClient: MCPClientWrapper;
+  private connection: amqp.Connection;
+  private channel: amqp.Channel;
+  // @ts-ignore
+  private replyQueue: string;
+  private pendingResponses: Map<string, (msg: amqp.ConsumeMessage) => void> = new Map();
+  private provider: ModelProvider;
+
   private logger = logger;
 
-  constructor(mcpClient: MCPClientWrapper) {
-    this.mcpClient = mcpClient;
+  // Initialize Ajv for schema validation
+  private ajv = new Ajv({
+    allErrors: true,
+    removeAdditional: false, // Do not remove extra properties
+    useDefaults: true,       // Use default values if defined
+  });
+
+  constructor(provider: ModelProvider) {
+    this.provider = provider;
+    // Initialize RabbitMQ connection
+    this.initializeRabbitMQ().catch((error) => {
+      this.logger.error('Failed to initialize RabbitMQ', { error });
+      throw error;
+    });
   }
 
-  async generateResponse(
-    prompt: string,
-    options?: ModelProviderOptions
-  ): Promise<string> {
+
+
+  async summarizeText(text: string): Promise<string> {
+    const prompt = `Please provide a concise summary of the following text:\n\n"${text}"`;
+    return await this.generateResponse(prompt);
+  }
+
+  async extractEntities(text: string): Promise<any[]> {
+    this.logger.info('Extracting entities via RabbitMQ');
+    const request = { text };
+    const response = await this.sendRPCMessage('entity_extraction_queue', request);
+
+    if (response.error) {
+      throw new Error(response.error);
+    }
+    const entities = response.entities || response;
+    return entities;
+  }
+
+  /**
+   * Initializes the RabbitMQ connection and sets up the reply queue.
+   */
+  private async initializeRabbitMQ() {
+    const rabbitmqHost = process.env.RABBITMQ_HOST || 'localhost';
+    const rabbitmqPort = parseInt(process.env.RABBITMQ_PORT || '5672', 10);
+    const rabbitmqUsername = process.env.RABBITMQ_USERNAME || 'admin';
+    const rabbitmqPassword = process.env.RABBITMQ_PASSWORD || 'NGVP12345';
+
+    const connectionString = `amqp://${rabbitmqUsername}:${rabbitmqPassword}@${rabbitmqHost}:${rabbitmqPort}`;
+
+    try {
+      this.connection = await amqp.connect(connectionString);
+      this.channel = await this.connection.createChannel();
+
+      // Assert reply queue
+      const { queue } = await this.channel.assertQueue('', { exclusive: true });
+      this.replyQueue = queue;
+
+      // Consume responses from the reply queue
+      await this.channel.consume(
+        this.replyQueue,
+        (msg: any) => {
+          if (msg && msg.properties.correlationId) {
+            const correlationId = msg.properties.correlationId;
+            const resolver = this.pendingResponses.get(correlationId);
+            if (resolver) {
+              resolver(msg);
+              this.pendingResponses.delete(correlationId);
+            }
+          }
+        },
+        { noAck: true }
+      );
+
+      this.logger.info('RabbitMQ initialized and reply queue set up.', { replyQueue: this.replyQueue });
+    } catch (error: any) {
+      this.logger.error('Error initializing RabbitMQ', { error: error.message });
+      throw new Error(`Failed to initialize RabbitMQ: ${error.message}`);
+    }
+  }
+
+  /**
+   * Generates a response using the underlying ModelProvider.
+   * @param prompt The prompt to send to the LLM.
+   * @param options Optional provider options.
+   * @returns The generated response.
+   */
+  async generateResponse(prompt: string, options?: ModelProviderOptions): Promise<string> {
     this.logger.debug('Sending prompt to LLM', { prompt, options });
 
     try {
-      const response = await this.mcpClient.generateResponse(prompt, options);
+      const response = await this.provider.generateResponse(prompt, options);
       this.logger.debug('Received response from LLM', { response });
       return response;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Error generating response from LLM', { error });
       throw new Error('Failed to generate response from LLM.');
     }
   }
 
+  /**
+   * Generates a response with tool support using the underlying ModelProvider.
+   * @param messages The conversation messages.
+   * @param tools The tools to be used.
+   * @param options Optional provider options.
+   * @returns The generated response and any tool calls.
+   */
   async generateWithTools(
     messages: ModelMessage[],
     tools: ToolFunction[],
     options?: ModelProviderOptions
   ): Promise<{ response?: string; toolCalls?: any[] }> {
-    this.logger.debug('Sending generate_with_tools request to MCP server', {
-      messages,
-      tools,
-      options,
-    });
+    this.logger.debug('Sending generate_with_tools request to LLM provider', { messages, tools, options });
 
     try {
-      const result = await this.mcpClient.generateWithTools(
-        messages,
-        tools,
-        options
-      );
+      const result = await this.provider.generateWithTools(messages, tools, options);
       this.logger.debug('Received generate_with_tools response', { result });
       return result;
-    } catch (error) {
-      this.logger.error('Error generating response with tools from LLM', {
-        error,
-      });
+    } catch (error: any) {
+      this.logger.error('Error generating response with tools from LLM', { error });
       throw new Error('Failed to generate response with tools from LLM.');
     }
   }
 
+  /**
+   * Continues with tool results using the underlying ModelProvider.
+   * @param messages The conversation messages.
+   * @param tools The tools to be used.
+   * @param toolResults The results from tool executions.
+   * @param options Optional provider options.
+   * @returns The continued response.
+   */
   async continueWithToolResult(
     messages: ModelMessage[],
     tools: ToolFunction[],
     toolResults: ToolResult[],
     options?: ModelProviderOptions
   ): Promise<{ response: string }> {
-    this.logger.debug(
-      'Sending continue_with_tool_result request to MCP server',
-      { messages, tools, toolResults, options }
-    );
+    this.logger.debug('Sending continue_with_tool_result request to LLM provider', { messages, tools, toolResults, options });
 
     try {
-      const result = await this.mcpClient.continueWithToolResult(
-        messages,
-        tools,
-        toolResults,
-        options
-      );
-      this.logger.debug('Received continue_with_tool_result response', {
-        result,
-      });
+      const result = await this.provider.continueWithToolResult(messages, tools, toolResults, options);
+      this.logger.debug('Received continue_with_tool_result response', { result });
       return result;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Error continuing with tool result in LLM', { error });
       throw new Error('Failed to continue with tool result in LLM.');
     }
   }
 
-  async summarizeText(text: string): Promise<string> {
-    const prompt = `Please provide a concise summary of the following text:\n\n"${text}"`;
+  /**
+   * Sends an RPC message to a specified queue and awaits the response.
+   * @param queue The RabbitMQ queue to send the message to.
+   * @param message The message payload.
+   * @returns The parsed response.
+   */
+  private async sendRPCMessage(queue: string, message: any): Promise<any> {
+    const correlationId = uuidv4();
+    const messageBuffer = Buffer.from(JSON.stringify(message));
 
-    return await this.generateResponse(prompt);
-  }
+    const responsePromise = new Promise<amqp.ConsumeMessage>((resolve) => {
+      this.pendingResponses.set(correlationId, resolve);
+    });
 
-  async translateText(
-    text: string,
-    targetLanguage: string
-  ): Promise<string> {
-    const prompt = `Translate the following text into ${targetLanguage}:\n\n"${text}"`;
+    this.channel.sendToQueue(queue, messageBuffer, {
+      correlationId: correlationId,
+      replyTo: this.replyQueue,
+    });
 
-    return await this.generateResponse(prompt);
-  }
+    this.logger.debug('Sent RPC message', { queue, correlationId, message });
 
-  async extractEntities(text: string): Promise<any[]> {
-    const prompt = `Extract entities from the following text and format them as a JSON array:\n\n"${text}"`;
+    const responseMsg = await responsePromise;
 
-    const llmResponse = await this.generateResponse(prompt);
-
+    const responseContent = responseMsg.content.toString();
+    let response: any;
     try {
-      const entities = JSON.parse(llmResponse);
-      return entities;
-    } catch (error) {
-      this.logger.error('Failed to parse entities from LLM response', {
-        llmResponse,
-      });
-      throw new Error('Failed to parse entities from LLM response.');
+      response = JSON.parse(responseContent);
+    } catch (parseError: any) {
+      this.logger.error('Failed to parse RPC response as JSON', { responseContent, parseError });
+      throw new Error('Invalid JSON response from RPC.');
     }
+
+    this.logger.debug('Received RPC response', { response });
+
+    return response;
   }
 
+  /**
+   * Extracts entities and relations from the provided text using the extraction tool.
+   * @param text The text to extract from.
+   * @returns An object containing arrays of entities and relations.
+   */
   async extractEntitiesAndRelations(
     text: string
-  ): Promise<{ entities: any[]; relations: any[] }> {
-    const prompt = `Extract entities and relationships from the following text:
+  ): Promise<{ entities: Entity[]; relations: Relation[] }> {
+    this.logger.info('Extracting entities and relations via RabbitMQ', { textLength: text.length });
 
-"${text}"
+    const request = { text };
+    const response = await this.sendRPCMessage('entity_extraction_queue', request);
 
-Format the response as JSON with "entities" and "relations" keys.`;
-
-    this.logger.debug('Sending prompt to LLM', { prompt });
-    let llmResponse;
-    try {
-      llmResponse = await this.mcpClient.generateResponse(prompt);
-      this.logger.debug('Received response from LLM', { llmResponse });
-
-      const result = JSON.parse(llmResponse);
-      return {
-        entities: result.entities,
-        relations: result.relations,
-      };
-    } catch (error) {
-      if (error instanceof SyntaxError) {
-        this.logger.error('Failed to parse LLM response as JSON', {
-          llmResponse,
-        });
-        throw new Error('Failed to parse LLM response as JSON.');
-      } else {
-        this.logger.error('Error generating response from LLM', { error });
-        throw new Error('Failed to generate response from LLM.');
-      }
+    if (response.error) {
+      this.logger.error('RPC extraction returned an error', { error: response.error });
+      throw new Error(response.error);
     }
+
+    let entities: Entity[] = [];
+    let relations: Relation[] = [];
+
+    if (Array.isArray(response)) {
+      // If response is an array, assume it's a list of entities
+      entities = response.map((item: any) => ({
+        id: uuidv4(), // Assign a new UUID if not provided
+        name: item.name || 'Unnamed Entity',
+        type: item.type || 'Unknown',
+        ...item,
+      }));
+    } else if (typeof response === 'object') {
+      // If response is an object, expect entities and relations
+      entities = response.entities || [];
+      relations = response.relations || [];
+    }
+
+    this.logger.debug('Parsed extraction response', { entitiesCount: entities.length, relationsCount: relations.length });
+
+    return { entities, relations };
   }
+  
+
+  /**
+   * Cleans the LLM response by removing markdown and unnecessary formatting.
+   * @param llmResponse The raw response from the LLM.
+   * @returns The cleaned response string.
+   */
+  private cleanLLMResponse(llmResponse: string): string {
+    // Trim leading and trailing whitespace
+    llmResponse = llmResponse.trim();
+
+    // Remove ```json or ``` if present at the start and end
+    if (llmResponse.startsWith('```json')) {
+      llmResponse = llmResponse.slice(7);
+    } else if (llmResponse.startsWith('```')) {
+      llmResponse = llmResponse.slice(3);
+    }
+
+    if (llmResponse.endsWith('```')) {
+      llmResponse = llmResponse.slice(0, -3);
+    }
+
+    // Trim again after removing backticks
+    return llmResponse.trim();
+  }
+
+  /**
+   * Processes the LLM response to extract entities and relations.
+   * @param llmResponse The raw response from the LLM.
+   * @returns An object containing arrays of entities and relations.
+   */
+  processEntitiesAndRelations(llmResponse: string): { entities: Entity[]; relations: Relation[] } {
+    // Clean the LLM response to remove any markdown formatting
+    llmResponse = this.cleanLLMResponse(llmResponse);
+
+    // Parse with JSON5
+    let parsedResponse: llmResponseType;
+    try {
+      parsedResponse = JSON5.parse(llmResponse);
+      this.logger.debug('Parsed LLM response', { parsedResponse });
+    } catch (error: any) {
+      this.logger.error('Failed to parse LLM response as JSON', { llmResponse, error: error.message });
+      throw new Error('Failed to parse LLM response as JSON.');
+    }
+
+    // Validate the parsed response against the schema
+    const validate = this.ajv.compile<llmResponseType>(llmResponseSchema);
+    const valid = validate(parsedResponse);
+
+    if (!valid) {
+      this.logger.error('LLM response does not conform to the schema', { errors: validate.errors });
+      throw new Error('LLM response does not conform to the schema.');
+    }
+
+    this.logger.debug('Validated LLM response');
+
+    // Return the parsed and processed data, including any additional fields
+    return {
+      entities: parsedResponse.entities.map((entity: Entity) => ({
+        ...entity, // Includes all properties, expected or not
+      })),
+      relations: parsedResponse.relations.map((relation: Relation) => ({
+        ...relation, // Includes all properties, expected or not
+      })),
+    };
+  }
+  
 }
+
+/**
+ * TypeScript type for the LLM response based on the schema.
+ */
+interface llmResponseType {
+  entities: Entity[];
+  relations: Relation[];
+  [key: string]: any; // Allows additional properties at the root level if needed
+}
+
 ```
 
 
@@ -1134,66 +1574,78 @@ export default logger;
 import { initializeAsync, getExaClient, getKGManager } from './dependencies';
 import { LLMClient } from './llmclient';
 import MCPServerWrapper from 'mcp-wrapper/src/mcp/MCPServer';
-import {MCPClientWrapper} from 'mcp-wrapper';
+import {MCPClientWrapper, OpenAIProvider} from 'mcp-wrapper';
 import { handleSearchAndStore } from './handlers/searchAndStore';
 import { summarizeText } from './tools/summarizeText';
 import { translateText } from './tools/translateText';
 import { extractEntities } from './tools/extractEntities';
 import logger from './loggerInstance';
+import dotenv from 'dotenv'
+
+dotenv.config();
+
 
 async function main(): Promise<MCPServerWrapper> {
-  // Initialize dependencies
-  const exaClient = getExaClient();
-  const kgManager = getKGManager();
+  try {
+    // Initialize dependencies
+    const exaClient = getExaClient();
+    const kgManager = getKGManager();
 
-  // Step 1: Initialize MCPServerWrapper without toolHandlers and ModelProvider
-  console.log('8. Initializing MCPServerWrapper...');
-  const mcpServer = new MCPServerWrapper('simplified-agent', '1.0.0');
-  console.log('9. MCPServerWrapper initialized.');
+    // Step 1: Initialize MCPServerWrapper without toolHandlers and ModelProvider
+    console.log('8. Initializing MCPServerWrapper...');
+    const mcpServer = new MCPServerWrapper('simplified-agent', '1.0.0');
+    console.log('9. MCPServerWrapper initialized.');
 
-  // Step 2: Initialize MCPClientWrapper with mcpServer
-  console.log('10. Initializing MCPClientWrapper...');
-  const mcpClient = new MCPClientWrapper(mcpServer);
-  console.log('11. MCPClientWrapper initialized.');
+    // Step 2: Initialize MCPClientWrapper with mcpServer
+    // Initialize OpenAIProvider (or any other provider)
+    const openAIProvider = new OpenAIProvider(process.env.OPENAI_API_KEY as string);
 
-  // Step 3: Initialize LLMClient with mcpClient
-  console.log('12. Initializing LLMClient...');
-  const llmClient = new LLMClient(mcpClient);
-  console.log('13. LLMClient initialized.');
+    // Step 3: Initialize LLMClient with mcpClient
+    console.log('12. Initializing LLMClient...');
+    const llmClient = new LLMClient(openAIProvider);
+    console.log('13. LLMClient initialized.');
 
-  // Step 4: Now that llmClient is available, define toolHandlers
-  console.log('14. Defining toolHandlers...');
-  const toolHandlers = {
-    search_and_store: async (args: any) => {
-      // @ts-ignore
-      return await handleSearchAndStore(args, { exaClient, kgManager, llmClient, logger });
-    },
-    summarize_text: async (args: any) => {
-      // @ts-ignore
-      return await summarizeText(args.text, llmClient, logger);
-    },
-    translate_text: async (args: any) => {
-      // @ts-ignore
-      return await translateText(args.text, args.targetLanguage, llmClient, logger);
-    },
-    extract_entities: async (args: any) => {
-      // @ts-ignore
-      return await extractEntities(args.text, llmClient, logger);
-    },
-  };
-  console.log('15. toolHandlers defined.');
+    // Step 4: Now that llmClient is available, define toolHandlers
+    console.log('14. Defining toolHandlers...');
+    const toolHandlers = {
+      search_and_store: async (args: any) => {
+        return await handleSearchAndStore(args, {
+          exaClient,
+          kgManager,
+          llmClient,
+          logger,
+        });
+      },
+      summarize_text: async (args: any) => {
+        // @ts-ignore
+        return await summarizeText(args.text, llmClient, logger);
+      },
+      translate_text: async (args: any) => {
+        // @ts-ignore
+        return await translateText(args.text, args.targetLanguage, llmClient, logger);
+      },
+      extract_entities: async (args: any) => {
+        // @ts-ignore
+        return await extractEntities(args.text, llmClient, logger);
+      },
+    };
+    console.log('15. toolHandlers defined.');
 
-  // Step 5: Set toolHandlers and ModelProvider in mcpServer
-  console.log('16. Setting toolHandlers and modelProvider in MCPServerWrapper...');
-  mcpServer.setToolHandlers(toolHandlers);
-  mcpServer.setModelProvider(llmClient);
-  console.log('17. toolHandlers and modelProvider set in MCPServerWrapper.');
+    // Step 5: Set toolHandlers and ModelProvider in mcpServer
+    console.log('16. Setting toolHandlers and modelProvider in MCPServerWrapper...');
+    mcpServer.setToolHandlers(toolHandlers);
+    mcpServer.setModelProvider(llmClient);
+    console.log('17. toolHandlers and modelProvider set in MCPServerWrapper.');
 
-  // Your server is now fully set up
-  console.log('18. MCPServerWrapper is fully initialized.');
+    // Your server is now fully set up
+    console.log('18. MCPServerWrapper is fully initialized.');
 
-  // Return the MCPServerWrapper instance
-  return mcpServer;
+    // Return the MCPServerWrapper instance
+    return mcpServer;
+  } catch (error: any) {
+    console.error('Error initializing MCP server:', error);
+    throw error;
+  }
 }
 
 export { main };
@@ -1205,6 +1657,7 @@ export { main };
 ```typescript
 // src/tools/ToolRegistry.ts
 // @ts-ignore
+
 import type { ToolFunction } from 'mcp-wrapper';
 
 export class ToolRegistry {
@@ -1234,12 +1687,14 @@ export class ToolRegistry {
 ## ./src/tools/exaSearch.ts
 
 ```typescript
-// smcp-research-assistant/rc/tools/exaSearch.ts
+// mcp-research-assistant/src/tools/exaSearch.ts
 
 import { ExaClient } from '../exaClient';
 import Logger from '../logger';
+import * as JSON5 from 'json5';
+import Ajv, { JSONSchemaType } from 'ajv';
 
-type LoggerResearchAssistant = typeof Logger
+type LoggerResearchAssistant = typeof Logger;
 
 export interface SearchResult {
   text: string;
@@ -1249,7 +1704,12 @@ export interface SearchResult {
 }
 
 export class ExaSearchTool {
-  constructor(private logger: LoggerResearchAssistant, private exaClient: ExaClient) {}
+  private ajv: Ajv;
+
+  constructor(private logger: LoggerResearchAssistant, private exaClient: ExaClient) {
+    // Initialize Ajv instance
+    this.ajv = new Ajv();
+  }
 
   async search(query: string, options: { numResults?: number } = {}): Promise<SearchResult[]> {
     const { numResults = 10 } = options;
@@ -1257,17 +1717,50 @@ export class ExaSearchTool {
     this.logger.debug('Starting Exa search', { query, numResults });
 
     try {
-      const searchResults = await this.exaClient.searchAndContents(query, {
+      // Make the ExaClient call
+      const searchResults = await this.exaClient.search(query, {
         numResults,
         type: 'neural',
       });
 
-      const results = searchResults.results.map(result => ({
-        text: result.text || '',
-        url: result.url,
-        title: result.title,
-        score: result.score || 0,
-      }));
+      // Define schema for validation
+      const searchResultSchema: JSONSchemaType<SearchResult[]> = {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            text: { type: 'string' },
+            url: { type: 'string', nullable: true },
+            title: { type: 'string', nullable: true },
+            score: { type: 'number' },
+          },
+          required: ['text', 'score'],
+          additionalProperties: true,
+        },
+      };
+
+      // Parse and validate the results
+      const validate = this.ajv.compile(searchResultSchema);
+
+      const results = searchResults.map((result: any) => {
+        const parsedResult = JSON5.parse(JSON5.stringify(result));
+
+        // Validate each result
+        const valid = validate([parsedResult]);
+        if (!valid) {
+          this.logger.error('Invalid search result format', {
+            errors: validate.errors,
+          });
+          throw new Error('Invalid search result format');
+        }
+
+        return {
+          text: parsedResult.text || '',
+          url: parsedResult.url,
+          title: parsedResult.title,
+          score: parsedResult.score || 0,
+        };
+      });
 
       this.logger.info('Exa search completed successfully', {
         query,
@@ -1275,7 +1768,7 @@ export class ExaSearchTool {
       });
 
       return results;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Exa search failed', {
         query,
         error: error instanceof Error ? error.message : String(error),
@@ -1294,17 +1787,22 @@ export class ExaSearchTool {
 
 import { LLMClient } from '../llmclient';
 import Logger from '../logger';
+import { Entity, Relation } from '../types/kgTypes'; // Ensure correct import
 
-type LoggerResearchAssistant = typeof Logger
+type LoggerResearchAssistant = typeof Logger;
 
-export async function extractEntities(text: string, llmClient: LLMClient, logger: LoggerResearchAssistant): Promise<any[]> {
-  logger.info('Extracting entities from text');
+export async function extractEntities(
+  text: string,
+  llmClient: LLMClient,
+  logger: LoggerResearchAssistant
+): Promise<Entity[]> { // Specify return type as Entity[]
+  logger.info('Extracting entities from text using LLMClient');
   try {
     const entities = await llmClient.extractEntities(text);
     logger.info('Entities extracted successfully', { entityCount: entities.length });
     return entities;
-  } catch (error) {
-    logger.error('Error extracting entities', { error });
+  } catch (error: any) {
+    logger.error('Error extracting entities', { error: error.message });
     throw new Error('Failed to extract entities');
   }
 }
@@ -1321,6 +1819,7 @@ import { handleSearchAndStore } from '../handlers/searchAndStore';
 import { summarizeText } from './summarizeText';
 import { translateText } from './translateText';
 import { extractEntities } from './extractEntities';
+// @ts-ignore
 import { ToolFunction } from 'mcp-wrapper';
 import { getExaClient, getKGManager, getLLMClient, initializeAsync, logger  } from '../dependencies';
 
@@ -1383,6 +1882,7 @@ ToolRegistry.registerTool(searchAndStoreTool, async (args: any) => {
   const llmClient = getLLMClient();
   const exaClient = getExaClient();
   const kgManager = getKGManager();
+  // @ts-ignore
   return await handleSearchAndStore(args, { exaClient, kgManager, llmClient, logger });
 });
 
@@ -1390,6 +1890,7 @@ ToolRegistry.registerTool(summarizeTextTool, async (args: any) => {
   await initializeAsync();
   
   const llmClient = getLLMClient();
+  // @ts-ignore
   return await summarizeText(args.text, llmClient, logger);
 });
 
@@ -1397,6 +1898,7 @@ ToolRegistry.registerTool(translateTextTool, async (args: any) => {
   await initializeAsync();
   
   const llmClient = getLLMClient();
+  // @ts-ignore
   return await translateText(args.text, args.targetLanguage, llmClient, logger);
 });
 
@@ -1404,6 +1906,7 @@ ToolRegistry.registerTool(extractEntitiesTool, async (args: any) => {
   await initializeAsync();
   
   const llmClient = getLLMClient();
+  // @ts-ignore
   return await extractEntities(args.text, llmClient, logger);
 });
 ```
@@ -1417,16 +1920,20 @@ ToolRegistry.registerTool(extractEntitiesTool, async (args: any) => {
 import { LLMClient } from '../llmclient';
 import Logger from '../logger';
 
-type LoggerResearchAssistant = typeof Logger
+type LoggerResearchAssistant = typeof Logger;
 
-export async function summarizeText(text: string, llmClient: LLMClient, logger: LoggerResearchAssistant): Promise<string> {
-  logger.info('Summarizing text');
+export async function summarizeText(
+  text: string,
+  llmClient: LLMClient,
+  logger: LoggerResearchAssistant
+): Promise<string> {
+  logger.info('Summarizing text using LLMClient');
   try {
     const summary = await llmClient.summarizeText(text);
     logger.info('Text summarized successfully');
     return summary;
-  } catch (error) {
-    logger.error('Error summarizing text', { error });
+  } catch (error: any) {
+    logger.error('Error summarizing text', { error: error.message });
     throw new Error('Failed to summarize text');
   }
 }
@@ -1441,7 +1948,7 @@ export async function summarizeText(text: string, llmClient: LLMClient, logger: 
 import { LLMClient } from '../llmclient';
 import Logger from '../logger';
 
-type LoggerResearchAssistant = typeof Logger
+type LoggerResearchAssistant = typeof Logger;
 
 export async function translateText(
   text: string,
@@ -1451,11 +1958,10 @@ export async function translateText(
 ): Promise<string> {
   logger.info('Translating text', { targetLanguage });
   try {
-    const translation = await llmClient.translateText(text, targetLanguage);
-    logger.info('Text translated successfully');
-    return translation;
-  } catch (error) {
-    logger.error('Error translating text', { error });
+    // RabbitMQ or API integration for translateText
+    throw new Error('translateText not implemented via RabbitMQ');
+  } catch (error: any) {
+    logger.error('Error translating text', { error: error.message });
     throw new Error('Failed to translate text');
   }
 }
@@ -1519,22 +2025,23 @@ export function sanitizeError(error: unknown): Record<string, unknown> {
 export interface Entity {
   id: string;
   name: string;
+  description?: string;
   type: string;
-  observations: string[];
-  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  url?: string;
+  content?: string; // Ensure this is present
+  [key: string]: any;
 }
 
 export interface Relation {
   id: string;
-  from: string;  // Entity ID
-  to: string;    // Entity ID
+  sourceId: string;
+  targetId: string;
   type: string;
-  label?: string;
-  metadata?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
+  [key: string]: any;
 }
 
 export interface KnowledgeGraph {

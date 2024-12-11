@@ -3,7 +3,7 @@
 import { LLMClient } from '../llmclient';
 import Logger from '../logger';
 
-type LoggerResearchAssistant = typeof Logger
+type LoggerResearchAssistant = typeof Logger;
 
 export async function translateText(
   text: string,
@@ -13,11 +13,10 @@ export async function translateText(
 ): Promise<string> {
   logger.info('Translating text', { targetLanguage });
   try {
-    const translation = await llmClient.translateText(text, targetLanguage);
-    logger.info('Text translated successfully');
-    return translation;
-  } catch (error) {
-    logger.error('Error translating text', { error });
+    // RabbitMQ or API integration for translateText
+    throw new Error('translateText not implemented via RabbitMQ');
+  } catch (error: any) {
+    logger.error('Error translating text', { error: error.message });
     throw new Error('Failed to translate text');
   }
 }

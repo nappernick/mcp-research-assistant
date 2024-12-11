@@ -2,6 +2,7 @@
 
 import Exa from 'exa-js';
 import Logger, { ILogger } from './logger';
+import { v4 as uuidv4 } from 'uuid';
 
 export interface ExaSearchOptions {
   numResults?: number;
@@ -32,6 +33,12 @@ export class ExaClient {
     this.logger = logger;
   }
 
+  /**
+   * Performs a search using ExaClient.
+   * @param query The search query.
+   * @param options Optional search parameters.
+   * @returns An array of search results.
+   */
   async search(query: string, options: ExaSearchOptions = {}): Promise<ExaSearchResult[]> {
     const { numResults = 10, type = 'auto', useAutoprompt = true } = options;
 
@@ -49,13 +56,14 @@ export class ExaClient {
       const results = searchResponse.results;
 
       if (!results || results.length === 0) {
-        this.logger.warn('No search results found');
+        this.logger.warn('No search results found', { query });
         return [];
       }
 
       const formattedResults = results.map(result => ({
         ...result,
-        title: result.title ?? undefined,
+        title: result.title ?? 'No Title',
+        id: uuidv4(), // Assign a unique ID to each result if needed
       }));
 
       this.logger.debug('Search results received', { results: formattedResults });

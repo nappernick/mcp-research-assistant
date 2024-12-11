@@ -1,8 +1,7 @@
-// smcp-research-assistant/rc/tools/exaSearch.ts
+// mcp-research-assistant/src/tools/exaSearch.ts
 
 import { ExaClient } from '../exaClient';
 import Logger from '../logger';
-// Import JSON5 and Ajv
 import * as JSON5 from 'json5';
 import Ajv, { JSONSchemaType } from 'ajv';
 
@@ -54,10 +53,8 @@ export class ExaSearchTool {
       // Parse and validate the results
       const validate = this.ajv.compile(searchResultSchema);
 
-      // Use JSON5.parse in case the data isn't standard JSON
       const results = searchResults.map((result: any) => {
-        const resultJson = JSON5.stringify(result);
-        const parsedResult = JSON5.parse(resultJson);
+        const parsedResult = JSON5.parse(JSON5.stringify(result));
 
         // Validate each result
         const valid = validate([parsedResult]);
@@ -82,7 +79,7 @@ export class ExaSearchTool {
       });
 
       return results;
-    } catch (error) {
+    } catch (error: any) {
       this.logger.error('Exa search failed', {
         query,
         error: error instanceof Error ? error.message : String(error),
